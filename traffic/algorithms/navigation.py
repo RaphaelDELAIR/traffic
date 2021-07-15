@@ -1,3 +1,4 @@
+import logging
 import warnings
 from operator import attrgetter
 from typing import (
@@ -13,9 +14,11 @@ from typing import (
 
 import numpy as np
 import pandas as pd
+from pyproj.exceptions import CRSError
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
-from ..core.geodesy import destination, mrr_diagonal
+from ..algorithms.douglas_peucker import douglas_peucker
+from ..core.geodesy import destination, distance, mrr_diagonal
 from ..core.iterator import flight_iterator
 from ..core.time import deltalike, to_timedelta
 
@@ -849,7 +852,10 @@ class NavigationFeatures:
         Example usage:
 
         >>> parking = flight.on_parking_position('LSZH').max()
-        # returns the most probable parking position in terms of duration
+        # returns the part of the flight on the most probable
+        # parking position in terms of duration
+        # Also adds a column 'parking_position' with the
+        # name of the associated gate
 
         .. warning::
 
@@ -883,7 +889,7 @@ class NavigationFeatures:
         self,
         speed_threshold: float = 2,
         time_threshold: str = "30s",
-        filter_dict=dict(compute_gs=3),
+        filter_dict=dict(compute_gs=31),  # Higher
         resample_rule: str = "5s",
     ) -> Optional["Flight"]:
         """
@@ -929,6 +935,7 @@ class NavigationFeatures:
         filter_dict=dict(
             compute_track_unwrapped=21, compute_track=21, compute_gs=21
         ),
+        moving_filter_dict=dict(compute_gs=15),
         track_threshold: float = 90,
     ) -> Optional["Flight"]:
         """
@@ -959,22 +966,22 @@ class NavigationFeatures:
         if within_airport is None:
             return None
 
-        parking_position = within_airport.on_parking_position(_airport).next()
+        parking_position = within_airport.on_parking_position(_airport).max()
         if parking_position is None:
             return None
 
         after_parking = within_airport.after(parking_position.start)
         assert after_parking is not None
 
-        in_movement = after_parking.moving()
+        in_movement = after_parking.moving(moving_filter_dict)
 
         if in_movement is None:
             return None
 
         direction_change = (
             # trim the first few seconds to avoid annoying first spike
-            in_movement.first("5T")
-            .last("4T30s")
+            in_movement.first("7T")
+            .last("6T30s")
             .cumulative_distance()
             .unwrap(["compute_track"])
             .filter(**filter_dict)
@@ -1105,3 +1112,138 @@ class NavigationFeatures:
             candidate = self.between(segment_times[0], segment_times[-1])
             if candidate is not None:
                 yield candidate
+
+    def assign_twy(self, airport, long_twy_df=None):
+        """
+        For each datapoint of a ground trajectory,
+        assigns in a new column 'twy' the
+        name of the long taxiway the point situated on.
+
+        @param long_twy_df: is a dataframe containing shapely
+                            geometry column with corresponding twy encoded
+        """
+
+        def ground_movement_type(self, airport):
+            self = cast("Flight", self)
+            if self.destination == airport and self.origin == airport:
+                return "BOTH"
+            if self.origin == airport:
+                return "DEP"
+            if self.destination == airport:
+                return "ARR"
+            else:
+                return None
+
+        def get_long_twy(airport):
+            """
+            Returns selection of twys that are referenced by a unique letter,
+            hence they are considered as 'long' or 'main' taxiways
+            """
+            from ..data import airports
+
+            apt = airports[airport]
+            if apt is None:
+                return None
+            assert apt is not None
+            apt_twy = apt.taxiway
+            assert apt_twy is not None
+            apt_long_twy = apt_twy.query("ref==ref & ref.str.len()==1")
+            assert apt_long_twy is not None
+            df = apt_long_twy._data
+            assert df is not None
+            return (
+                df.groupby("ref")
+                .agg({"geometry": list})["geometry"]
+                .apply(MultiLineString)
+                .to_frame()
+            )
+
+        self = cast("Flight", self)
+        if self is None:
+            return self
+        if not (self.origin == airport or self.destination == airport):
+            logging.debug(
+                f"{self.flight_id} has a weird origin ({self.origin}) "
+                + "or destination ({self.destination})"
+            )
+            return self
+
+        if long_twy_df is None:
+            long_twy_df = get_long_twy(airport)
+        f_ground = self.onground()
+        if f_ground is None:
+            return self
+        f_ground = f_ground.moving()
+        if f_ground is None:
+            return self
+        pb = self.pushback("LSZH")
+
+        mvt_type = self.ground_movement_type(airport)
+        if mvt_type == "BOTH":
+            logging.debug(
+                self.flight_id,
+                " takes off from and lands to the same airport",
+            )
+            # raise NotImplementedError  # TODO
+            return self
+        elif mvt_type == "DEP":
+            if pb is not None:
+                f_ground = f_ground.after(pb.stop)
+            if f_ground is None:
+                return self
+            if self.aligned_on_runway("LSZH").has():
+                aligned_f = self.aligned_on_runway("LSZH").max()
+                assert aligned_f is not None
+                f_ground = f_ground.before(aligned_f.start)
+            else:
+                return self
+        elif mvt_type == "ARR":
+            pp = self.on_parking_position(airport).next()
+            if pp is not None:
+                f_ground = f_ground.before(pp.start)
+            if f_ground is None:
+                return self
+            if self.aligned_on_runway("LSZH").has():
+                aligned_f = self.aligned_on_runway("LSZH").max()
+                assert aligned_f is not None
+                f_ground = f_ground.after(aligned_f.stop)
+            else:
+                return self
+
+        if f_ground is None:
+            return self
+
+        try:
+            mask = douglas_peucker(
+                df=f_ground.data, tolerance=15, lat="latitude", lon="longitude"
+            )
+        except CRSError:
+            return self
+
+        simplified_df = f_ground.data.loc[mask]
+        df = self.data
+
+        for i in range(1, len(simplified_df)):
+            t1 = simplified_df.iloc[i - 1].timestamp
+            t2 = simplified_df.iloc[i].timestamp
+            p1 = Point(
+                simplified_df.iloc[i - 1].longitude,
+                simplified_df.iloc[i - 1].latitude,
+            )
+            p2 = Point(
+                simplified_df.iloc[i].longitude, simplified_df.iloc[i].latitude
+            )
+
+            def extremities_dist(twy):
+                p1_proj = twy.interpolate(twy.project(p1))
+                p2_proj = twy.interpolate(twy.project(p2))
+                d1 = distance(p1_proj.y, p1_proj.x, p1.y, p1.x)
+                d2 = distance(p2_proj.y, p2_proj.x, p2.y, p2.x)
+                return d1 + d2
+
+            temp_ = long_twy_df.assign(dist=np.vectorize(extremities_dist))
+            nearest_twy = temp_["dist"].idxmin()
+            self.data.loc[
+                (t1 < df.timestamp) & (df.timestamp <= t2), "twy"
+            ] = nearest_twy
+        return self
