@@ -889,7 +889,7 @@ class NavigationFeatures:
         self,
         speed_threshold: float = 2,
         time_threshold: str = "30s",
-        filter_dict=dict(compute_gs=31),  # Higher
+        filter_dict=dict(compute_gs=3),
         resample_rule: str = "5s",
     ) -> Optional["Flight"]:
         """
@@ -973,7 +973,10 @@ class NavigationFeatures:
         after_parking = within_airport.after(parking_position.start)
         assert after_parking is not None
 
-        in_movement = after_parking.moving(moving_filter_dict)
+        # Big filter on moving method in order to be less sensitives
+        # to 'star' shaped positions when the aircraft is parked
+        # after_parking.after(after_parking.moving(moving_filter_dict).start)
+        in_movement = after_parking.moving()
 
         if in_movement is None:
             return None
@@ -992,9 +995,18 @@ class NavigationFeatures:
         if direction_change is None:
             return None
 
-        return in_movement.before(direction_change.start).assign(
-            parking_position=parking_position.parking_position_max
+        pushback_segment = (
+            in_movement.before(direction_change.start)
+            .assign(parking_position=parking_position.parking_position_max)
+            .cumulative_distance()
+            .eval()
         )
+
+        # Too long pushbacks
+        # if pushback_segment.cumdist_max > 0.2:
+        #    return None
+
+        return pushback_segment
 
     def is_from_inertial(self, freq_threshold=0.05) -> bool:
         """
